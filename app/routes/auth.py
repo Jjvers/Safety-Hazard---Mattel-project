@@ -16,6 +16,8 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
     role: str
+    employee_id: str | None = None
+    department: str | None = None
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -43,6 +45,8 @@ def register(body: RegisterRequest, background_tasks: BackgroundTasks, db: Sessi
         password_hash=hash_password(body.password),
         role=body.role,
         status="pending",
+        employee_id=body.employee_id,
+        department=body.department,
     )
     db.add(user)
     db.commit()

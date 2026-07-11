@@ -18,6 +18,10 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 class ApproveRequest(BaseModel):
     status: str  # active / inactive
 
+class UpdateUserRequest(BaseModel):
+    employee_id: str | None = None
+    department: str | None = None
+
 @router.get("/users")
 def list_users(current_user = Depends(admin_only), db: Session = Depends(get_db)):
     users = db.query(User).all()
@@ -28,6 +32,8 @@ def list_users(current_user = Depends(admin_only), db: Session = Depends(get_db)
             "email": u.email,
             "role": u.role,
             "status": u.status,
+            "employee_id": u.employee_id,
+            "department": u.department,
             "created_at": str(u.created_at),
         }
         for u in users
@@ -51,12 +57,32 @@ def approve_user(
     user.status = body.status
     db.commit()
 
+    # Kirim email notifikasi ke user sesuai keputusan Admin
     if body.status == "active":
         background_tasks.add_task(send_approved, user.email, user.name)
     else:
         background_tasks.add_task(send_rejected, user.email, user.name)
 
     return {"message": f"User {body.status} successfully", "user_id": user_id}
+
+@router.patch("/users/{user_id}")
+def update_user(
+    user_id: str,
+    body: UpdateUserRequest,
+    current_user = Depends(admin_only),
+    db: Session = Depends(get_db)
+):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if body.employee_id is not None:
+        user.employee_id = body.employee_id
+    if body.department is not None:
+        user.department = body.department
+    db.commit()
+
+    return {"message": "User updated successfully", "user_id": user_id}
 
 @router.delete("/users/{user_id}")
 def delete_user(

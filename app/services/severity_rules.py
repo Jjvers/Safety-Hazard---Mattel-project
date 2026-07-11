@@ -1,17 +1,17 @@
 from datetime import date, timedelta
 
 # ── Severity lookup table ──────────────────────────────────
-# Berdasarkan 7 kelas hazard dari YOLO Johana
-# Priority dan due_date ditentukan rule-based, bukan oleh AI
-
+# YOLO Johana cuma detect KEBERADAAN objek (helmet, safety_vest, dst),
+# bukan KETIADAANNYA. Jadi hazard "no_helmet"/"no_safety_vest" itu
+# hasil INFERENSI di ai_pipeline.py (person terdeteksi TAPI helmet
+# tidak ada di daftar deteksi) — bukan label mentah dari YOLO.
 SEVERITY_TABLE = {
     "chemical_spill":  {"risk_level": "critical", "priority": "high",   "due_days": 1},
     "exposed_cable":   {"risk_level": "critical", "priority": "high",   "due_days": 1},
     "wet_floor":       {"risk_level": "high",     "priority": "high",   "due_days": 3},
     "blocked_walkway": {"risk_level": "high",     "priority": "high",   "due_days": 3},
-    "helmet":          {"risk_level": "medium",   "priority": "medium", "due_days": 7},
-    "safety_vest":     {"risk_level": "medium",   "priority": "medium", "due_days": 7},
-    "person":          {"risk_level": "low",      "priority": "low",    "due_days": 14},
+    "no_helmet":       {"risk_level": "medium",   "priority": "medium", "due_days": 7},
+    "no_safety_vest":  {"risk_level": "medium",   "priority": "medium", "due_days": 7},
 }
 
 # Fallback kalau label tidak dikenali
