@@ -115,7 +115,7 @@ def invalidate_reset_token(token: str):
 
 def send_reset_password(to_email: str, name: str) -> bool:
     token = generate_reset_token(to_email)
-    reset_url = f"{APP_URL}/auth/reset-password?token={token}"
+    reset_url = f"{APP_URL}/?token={token}"
     content = f"""
     <div class="greeting">Hi {name},</div>
     <div class="text">We received a request to reset your password for <strong>SafetyVision</strong>.</div>

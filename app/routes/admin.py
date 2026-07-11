@@ -1,13 +1,14 @@
 import os
 import uuid
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from app.database import get_db
 from app.middleware.auth import admin_only
 from app.models.user import User
 from app.models.ehss_document import EhssDocument
+from app.services.email_service import send_approved, send_rejected
 
 router = APIRouter()
 
@@ -36,6 +37,7 @@ def list_users(current_user = Depends(admin_only), db: Session = Depends(get_db)
 def approve_user(
     user_id: str,
     body: ApproveRequest,
+    background_tasks: BackgroundTasks,
     current_user = Depends(admin_only),
     db: Session = Depends(get_db)
 ):
@@ -48,6 +50,11 @@ def approve_user(
 
     user.status = body.status
     db.commit()
+
+    if body.status == "active":
+        background_tasks.add_task(send_approved, user.email, user.name)
+    else:
+        background_tasks.add_task(send_rejected, user.email, user.name)
 
     return {"message": f"User {body.status} successfully", "user_id": user_id}
 
