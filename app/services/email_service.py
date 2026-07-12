@@ -1,36 +1,58 @@
 import os
-import smtplib
+import httpx
 import secrets
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 from typing import Optional
 
-MAIL_USERNAME = os.getenv("MAIL_USERNAME")
-MAIL_PASSWORD = os.getenv("MAIL_PASSWORD")
-MAIL_FROM     = os.getenv("MAIL_FROM", MAIL_USERNAME)
-MAIL_SERVER   = os.getenv("MAIL_SERVER", "smtp.gmail.com")
-MAIL_PORT     = int(os.getenv("MAIL_PORT", 587))
-APP_URL       = os.getenv("APP_URL", "https://safetyvision-backend-production.up.railway.app")
+# ── Resend (HTTPS email API) ─────────────────────────────────
+# Railway memblokir semua koneksi SMTP keluar (port 25/465/587) di
+# paket Free, Trial, dan Hobby — jadi tidak peduli sebagus apa fix
+# socket-nya, SMTP langsung ke Gmail TIDAK AKAN PERNAH bisa connect
+# dari Railway kecuali upgrade ke paket Pro. Solusinya: pakai API
+# email lewat HTTPS (port 443), yang tidak pernah diblokir.
+#
+# Daftar gratis di https://resend.com, lalu ambil API key di
+# https://resend.com/api-keys, dan set sebagai env var RESEND_API_KEY
+# di Railway Variables.
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+RESEND_API_URL = "https://api.resend.com/emails"
+
+# MAIL_FROM harus pakai domain yang sudah diverifikasi di Resend
+# (Resend > Domains). Untuk testing cepat TANPA verifikasi domain,
+# pakai alamat bawaan Resend: onboarding@resend.dev
+MAIL_FROM = os.getenv("MAIL_FROM", "SafetyVision EHSS <onboarding@resend.dev>")
+APP_URL   = os.getenv("APP_URL", "https://safetyvision-backend-production.up.railway.app")
 
 reset_tokens: dict = {}
 
+
 def send_email(to_email: str, subject: str, html_body: str) -> bool:
+    if not RESEND_API_KEY:
+        print("[EMAIL ERROR] RESEND_API_KEY belum di-set di environment variables")
+        return False
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = f"SafetyVision EHSS <{MAIL_FROM}>"
-        msg["To"]      = to_email
-        msg.attach(MIMEText(html_body, "html"))
-        with smtplib.SMTP(MAIL_SERVER, MAIL_PORT) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(MAIL_USERNAME, MAIL_PASSWORD)
-            server.sendmail(MAIL_FROM, to_email, msg.as_string())
+        response = httpx.post(
+            RESEND_API_URL,
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": MAIL_FROM,
+                "to": [to_email],
+                "subject": subject,
+                "html": html_body,
+            },
+            timeout=15,
+        )
+        if response.status_code >= 400:
+            print(f"[EMAIL ERROR] Resend API {response.status_code}: {response.text}")
+            return False
         return True
     except Exception as e:
         print(f"[EMAIL ERROR] {e}")
         return False
+
 
 def base_template(content: str) -> str:
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
