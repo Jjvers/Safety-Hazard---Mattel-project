@@ -1,6 +1,7 @@
 import os
 import uuid
 import httpx
+from supabase import create_client
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -15,6 +16,8 @@ router = APIRouter()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
+def get_supabase():
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 class ApproveRequest(BaseModel):
     status: str  # active / inactive
 
@@ -98,6 +101,11 @@ def delete_user(
     db.commit()
     return {"message": "User deleted successfully"}
 
+from supabase import create_client
+
+def get_supabase_client():
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
 # ── POST /admin/ehss-docs ───────────────────────────────────
 @router.post("/ehss-docs", status_code=201)
 async def upload_ehss_doc(
@@ -108,27 +116,19 @@ async def upload_ehss_doc(
     db: Session = Depends(get_db)
 ):
     try:
-        # Validate file type
-        if not file.content_type == "application/pdf":
+        if file.content_type != "application/pdf":
             raise HTTPException(status_code=400, detail="Only PDF files are allowed")
-        
+
         file_bytes = await file.read()
         filename = f"{uuid.uuid4()}_{file.filename}"
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            upload_res = await client.post(
-                f"{SUPABASE_URL}/storage/v1/object/ehss-docs/{filename}",
-                headers={
-                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                    "Content-Type": file.content_type,
-                },
-                content=file_bytes
-            )
-
-        if upload_res.status_code not in [200, 201]:
-            error_detail = upload_res.text
-            print(f"Supabase upload error: {error_detail}")
-            raise HTTPException(status_code=500, detail=f"Failed to upload document: {error_detail}")
+        # Upload pakai Supabase Python client (bukan raw HTTP)
+        supabase = get_supabase_client()
+        res = supabase.storage.from_("ehss-docs").upload(
+            path=filename,
+            file=file_bytes,
+            file_options={"content-type": "application/pdf"}
+        )
 
         file_url = f"{SUPABASE_URL}/storage/v1/object/public/ehss-docs/{filename}"
 
@@ -149,7 +149,7 @@ async def upload_ehss_doc(
             "category": doc.category,
             "uploaded_at": str(doc.uploaded_at),
         }
-    
+
     except HTTPException:
         raise
     except Exception as e:
@@ -157,7 +157,6 @@ async def upload_ehss_doc(
         print(f"Error uploading EHSS document: {str(e)}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to upload document: {str(e)}")
-
 
 @router.get("/ehss-docs")
 def list_ehss_docs(
