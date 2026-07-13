@@ -8,10 +8,10 @@ RAG_SERVICE_URL  = os.getenv("RAG_SERVICE_URL",  "http://localhost:8080")
 
 async def call_yolo(image_url: str) -> list:
     async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(
-            f"{YOLO_SERVICE_URL}/detect-sahi",
-            json={"image_url": image_url}
-        )
+        img_res = await client.get(image_url)
+        img_res.raise_for_status()
+        files = {"image": ("image.jpg", img_res.content, "image/jpeg")}
+        response = await client.post(f"{YOLO_SERVICE_URL}/detect-sahi", files=files)
         response.raise_for_status()
         return response.json().get("detections", [])
 
@@ -19,10 +19,10 @@ async def call_yolo(image_url: str) -> list:
 async def call_ocr(image_url: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{YOLO_SERVICE_URL}/ocr",
-                json={"image_url": image_url}
-            )
+            img_res = await client.get(image_url)
+            img_res.raise_for_status()
+            files = {"image": ("image.jpg", img_res.content, "image/jpeg")}
+            response = await client.post(f"{YOLO_SERVICE_URL}/ocr", files=files)
             response.raise_for_status()
             return response.json().get("ocr_text", "")
     except Exception:
@@ -59,9 +59,7 @@ async def run_full_pipeline(image_url: str) -> list:
         d for d in detections if d.get("label", "").lower() in ENV_HAZARD_LABELS
     ]
 
-    # b) Hazard PPE — YOLO cuma detect KEBERADAAN helmet/safety_vest (bukan
-    #    ketiadaannya), jadi hazard "no_helmet"/"no_safety_vest" harus
-    #    DIINFERENSI: ada "person" di gambar, tapi item PPE-nya absen.
+    # b) Hazard PPE — YOLO cuma detect KEBERADAAN helmet/safety_vest 
     if person_detections:
         person_confidence = max(d.get("confidence_score", 1.0) for d in person_detections)
         if "helmet" not in detected_labels:
@@ -72,8 +70,8 @@ async def run_full_pipeline(image_url: str) -> list:
     if not hazard_detections:
         return []  # tidak ada hazard lingkungan, dan PPE lengkap → area aman
 
-    # 2. OCR — opsional, tidak gagalkan pipeline
-    ocr_text = await call_ocr(image_url)
+    
+    ocr_text = ""
 
     # 3. RAG — kirim semua hazard sekaligus (batch)
     hazard_inputs = [

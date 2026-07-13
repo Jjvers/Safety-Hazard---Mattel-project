@@ -2,22 +2,23 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.orm import Session
 from typing import Optional
 import uuid
+import os
+from supabase import create_client
 from app.database import get_db
 from app.middleware.auth import get_current_user, inspector_only, manager_or_admin
 from app.models.user import User
 from app.models.inspection import Inspection
 from app.models.hazard import Hazard
 from app.models.corrective_action import CorrectiveAction
-from app.services.severity_rules import get_severity
-import httpx
-import os
+from app.services.ai_pipeline import run_full_pipeline
 
 router = APIRouter()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-YOLO_SERVICE_URL = os.getenv("YOLO_SERVICE_URL", "http://localhost:8000")
-RAG_SERVICE_URL = os.getenv("RAG_SERVICE_URL", "http://localhost:8080")
+
+def get_supabase():
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
 # ── POST /inspections ──────────────────────────────────────
@@ -29,22 +30,21 @@ async def create_inspection(
     current_user: User = Depends(inspector_only),
     db: Session = Depends(get_db)
 ):
-    # Upload image ke Supabase Storage
+    # Upload image ke Supabase Storage pakai supabase-py client
+    # (bukan httpx manual — key format baru Supabase tidak selalu
+    # bisa dipakai langsung di header Authorization: Bearer)
     image_bytes = await image.read()
     filename = f"{uuid.uuid4()}_{image.filename}"
 
-    async with httpx.AsyncClient() as client:
-        upload_res = await client.post(
-            f"{SUPABASE_URL}/storage/v1/object/inspections/{filename}",
-            headers={
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "Content-Type": image.content_type,
-            },
-            content=image_bytes
+    supabase = get_supabase()
+    try:
+        supabase.storage.from_("inspections").upload(
+            path=filename,
+            file=image_bytes,
+            file_options={"content-type": image.content_type or "image/jpeg", "upsert": "true"}
         )
-
-    if upload_res.status_code not in [200, 201]:
-        raise HTTPException(status_code=500, detail="Failed to upload image")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload image: {str(e)}")
 
     image_url = f"{SUPABASE_URL}/storage/v1/object/public/inspections/{filename}"
 
@@ -86,69 +86,31 @@ async def analyze_inspection(
     if not inspection.image_url:
         raise HTTPException(status_code=400, detail="No image found for this inspection")
 
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            # 1. Call YOLO service
-            yolo_res = await client.post(
-                f"{YOLO_SERVICE_URL}/detect",
-                json={"image_url": inspection.image_url}
-            )
-            detections = yolo_res.json().get("detections", [])
+    # Pakai satu-satunya pipeline resmi (YOLO SAHI + OCR + RAG + inferensi
+    # PPE) di ai_pipeline.py — supaya tidak ada logic ganda yang bisa beda
+    # hasil antara sini dan tempat lain.
+    hazard_results = await run_full_pipeline(inspection.image_url)
 
-            # 2. Call OCR service
-            ocr_res = await client.post(
-                f"{YOLO_SERVICE_URL}/ocr",
-                json={"image_url": inspection.image_url}
-            )
-            ocr_text = ocr_res.json().get("ocr_text", "")
-
-            # 3. Call RAG service (batch)
-            rag_res = await client.post(
-                f"{RAG_SERVICE_URL}/rag/generate-corrective-actions",
-                json={"hazards": [
-                    {
-                        "label": d.get("label"),
-                        "confidence_score": d.get("confidence_score"),
-                        "ocr_text": ocr_text
-                    }
-                    for d in detections
-                ]}
-            )
-            rag_results = rag_res.json().get("actions", [])
-
-    except Exception:
-        # Kalau AI service belum jalan, pakai mock data
-        detections = [{"label": "no_helmet", "confidence_score": 0.92}]
-        ocr_text = ""
-        rag_results = [{"label": "no_helmet", "action_description": "Provide helmet immediately per EHSS standard"}]
-
-    # 4. Simpan hazards + corrective actions
-    rag_map = {r["label"]: r for r in rag_results}
+    # Simpan hazards + corrective actions
     hazard_list = []
-
-    for detection in detections:
-        label = detection.get("label", "unknown")
-        confidence = detection.get("confidence_score", 1.0)
-        severity = get_severity(label, confidence)
-        rag = rag_map.get(label, {})
-
+    for h in hazard_results:
         hazard = Hazard(
             inspection_id=inspection.id,
-            category=label.replace("_", " ").title(),
-            risk_level=severity["risk_level"],
-            confidence_score=confidence,
-            yolo_label=label,
-            ocr_text=ocr_text,
-            description=rag.get("action_description", "")
+            category=h["category"],
+            risk_level=h["risk_level"],
+            confidence_score=h["confidence_score"],
+            yolo_label=h["yolo_label"],
+            ocr_text=h["ocr_text"],
+            description=h["corrective_action"]["action_description"]
         )
         db.add(hazard)
         db.flush()
 
         action = CorrectiveAction(
             hazard_id=hazard.id,
-            action_description=rag.get("action_description", "Refer to EHSS guidelines"),
-            priority=severity["priority"],
-            due_date=severity["due_date"],
+            action_description=h["corrective_action"]["action_description"],
+            priority=h["corrective_action"]["priority"],
+            due_date=h["corrective_action"]["due_date"],
             action_status="open"
         )
         db.add(action)
@@ -177,7 +139,48 @@ async def analyze_inspection(
     }
 
 
-# ── GET /inspections ───────────────────────────────────────
+# ── POST /inspections/live-preview ─────────────────────────
+# Endpoint ringan buat live camera preview (Opsi A): TIDAK nulis ke DB,
+# TIDAK panggil OCR/RAG — cuma deteksi cepat buat gambar bounding box
+# di video secara berkala (dipanggil tiap ~1-2 detik dari Streamlit).
+# Analisis resmi tetap lewat POST /inspections lalu /analyze seperti biasa.
+#
+# PENTING: endpoint /detect (yang "cepat", dipakai buat live preview) itu
+# beda format dari /detect-sahi — dia expect JSON {"image_url": ...},
+# BUKAN file upload. Jadi frame preview tetap perlu diupload ke Supabase
+# dulu (path per-user, upsert supaya tidak numpuk) baru URL-nya dikirim.
+import httpx
+YOLO_SERVICE_URL = os.getenv("YOLO_SERVICE_URL", "http://localhost:8000")
+
+@router.post("/live-preview")
+async def live_preview(
+    image: UploadFile = File(...),
+    current_user: User = Depends(inspector_only),
+):
+    image_bytes = await image.read()
+    filename = f"live-preview/{current_user.id}.jpg"
+
+    supabase = get_supabase()
+    try:
+        supabase.storage.from_("inspections").upload(
+            path=filename,
+            file=image_bytes,
+            file_options={"content-type": "image/jpeg", "upsert": "true"}
+        )
+    except Exception:
+        return {"detections": []}
+
+    image_url = f"{SUPABASE_URL}/storage/v1/object/public/inspections/{filename}"
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            res = await client.post(f"{YOLO_SERVICE_URL}/detect", json={"image_url": image_url})
+            res.raise_for_status()
+            detections = res.json().get("detections", [])
+    except Exception:
+        detections = []
+
+    return {"detections": detections}
 @router.get("/")
 def list_inspections(
     current_user: User = Depends(get_current_user),
