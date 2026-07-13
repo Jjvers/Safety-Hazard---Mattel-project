@@ -4,6 +4,7 @@ from pydantic import BaseModel, EmailStr
 from app.database import get_db
 from app.models.user import User
 from app.middleware.auth import hash_password, verify_password, create_access_token
+from app.services import email_service
 
 router = APIRouter()
 
@@ -18,6 +19,13 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
 
 
 @router.post("/register", status_code=201)
@@ -56,3 +64,33 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
 
     token = create_access_token(data={"sub": user.email, "role": user.role})
     return {"access_token": token, "token_type": "bearer", "role": user.role, "name": user.name}
+
+
+@router.post("/forgot-password")
+def forgot_password(body: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    # Selalu balas sukses (jangan bocorkan email mana yang terdaftar).
+    # Email reset hanya dikirim kalau user memang ada & aktif.
+    user = db.query(User).filter(User.email == body.email).first()
+    if user and user.status == "active":
+        email_service.send_reset_password(user.email, user.name)
+    return {"message": "If an account exists for that email, a reset link has been sent."}
+
+
+@router.post("/reset-password")
+def reset_password(body: ResetPasswordRequest, db: Session = Depends(get_db)):
+    if len(body.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    email = email_service.verify_reset_token(body.token)
+    if not email:
+        raise HTTPException(status_code=400, detail="Reset link is invalid or has expired")
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.password_hash = hash_password(body.new_password)
+    db.commit()
+    email_service.invalidate_reset_token(body.token)
+
+    return {"message": "Password has been reset. You can now sign in."}

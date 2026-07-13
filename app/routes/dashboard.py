@@ -18,6 +18,14 @@ def get_stats(
     total_inspections = db.query(Inspection).count()
     total_hazards = db.query(Hazard).count()
 
+    # Jumlah inspeksi per status (buat KPI card di dashboard)
+    analyzed_count = db.query(Inspection).filter(
+        Inspection.status == "analyzed"
+    ).count()
+    reported_count = db.query(Inspection).filter(
+        Inspection.status == "reported"
+    ).count()
+
     # Risk distribution
     risk_dist = db.query(
         Hazard.risk_level,
@@ -33,6 +41,8 @@ def get_stats(
     return {
         "total_inspections": total_inspections,
         "total_hazards": total_hazards,
+        "analyzed": analyzed_count,
+        "reported": reported_count,
         "risk_distribution": {r[0]: r[1] for r in risk_dist},
         "hazard_by_category": {c[0]: c[1] for c in category_dist},
     }
