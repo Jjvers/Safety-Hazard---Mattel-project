@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from io import BytesIO
 import os
-import httpx
+from supabase import create_client
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -21,6 +21,9 @@ router = APIRouter()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+def get_supabase():
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
 def generate_pdf(inspection, hazards) -> bytes:
@@ -117,16 +120,18 @@ async def generate_report(
     pdf_bytes = generate_pdf(inspection, hazards)
     filename = f"report_{inspection_id}.pdf"
 
-    # Upload ke Supabase Storage
-    async with httpx.AsyncClient() as client:
-        upload_res = await client.post(
-            f"{SUPABASE_URL}/storage/v1/object/reports/{filename}",
-            headers={
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "Content-Type": "application/pdf",
-            },
-            content=pdf_bytes
+    # Upload ke Supabase Storage pakai supabase-py client
+    # (bukan httpx manual — key format baru Supabase tidak selalu
+    # bisa dipakai langsung di header Authorization: Bearer)
+    supabase = get_supabase()
+    try:
+        supabase.storage.from_("reports").upload(
+            path=filename,
+            file=pdf_bytes,
+            file_options={"content-type": "application/pdf", "upsert": "true"}
         )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload PDF report: {str(e)}")
 
     pdf_url = f"{SUPABASE_URL}/storage/v1/object/public/reports/{filename}"
 
@@ -161,18 +166,17 @@ async def download_report(
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    # Fetch PDF dari Supabase Storage
-    async with httpx.AsyncClient() as client:
-        res = await client.get(
-            report.pdf_url,
-            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"}
-        )
+    filename = f"report_{report.inspection_id}.pdf"
 
-    if res.status_code != 200:
-        raise HTTPException(status_code=404, detail="PDF file not found")
+    # Fetch PDF dari Supabase Storage pakai supabase-py client
+    supabase = get_supabase()
+    try:
+        pdf_bytes = supabase.storage.from_("reports").download(filename)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"PDF file not found: {str(e)}")
 
     return StreamingResponse(
-        BytesIO(res.content),
+        BytesIO(pdf_bytes),
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=report_{report_id}.pdf"}
     )
