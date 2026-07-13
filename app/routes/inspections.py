@@ -16,8 +16,8 @@ router = APIRouter()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-YOLO_SERVICE_URL = os.getenv("YOLO_SERVICE_URL", "http://localhost:8001")
-RAG_SERVICE_URL = os.getenv("RAG_SERVICE_URL", "http://localhost:8002")
+YOLO_SERVICE_URL = os.getenv("YOLO_SERVICE_URL", "http://localhost:8000")
+RAG_SERVICE_URL = os.getenv("RAG_SERVICE_URL", "http://localhost:8080")
 
 
 # ── POST /inspections ──────────────────────────────────────
@@ -104,7 +104,7 @@ async def analyze_inspection(
 
             # 3. Call RAG service (batch)
             rag_res = await client.post(
-                f"{RAG_SERVICE_URL}/analyze",
+                f"{RAG_SERVICE_URL}/rag/generate-corrective-actions",
                 json={"hazards": [
                     {
                         "label": d.get("label"),
@@ -114,7 +114,7 @@ async def analyze_inspection(
                     for d in detections
                 ]}
             )
-            rag_results = rag_res.json().get("results", [])
+            rag_results = rag_res.json().get("actions", [])
 
     except Exception:
         # Kalau AI service belum jalan, pakai mock data
