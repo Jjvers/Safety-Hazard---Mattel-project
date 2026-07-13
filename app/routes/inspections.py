@@ -180,12 +180,17 @@ async def analyze_inspection(
 # ── GET /inspections ───────────────────────────────────────
 @router.get("/")
 def list_inspections(
-    current_user: User = Depends(inspector_only),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    inspections = db.query(Inspection).filter(
-        Inspection.user_id == current_user.id
-    ).order_by(Inspection.created_at.desc()).all()
+    """Allow all authenticated users to view their own inspections"""
+    # Inspector sees only their own, manager/admin see all
+    if current_user.role == "inspector":
+        inspections = db.query(Inspection).filter(
+            Inspection.user_id == current_user.id
+        ).order_by(Inspection.created_at.desc()).all()
+    else:
+        inspections = db.query(Inspection).order_by(Inspection.created_at.desc()).all()
 
     return [
         {

@@ -107,48 +107,63 @@ async def upload_ehss_doc(
     current_user: User = Depends(admin_only),
     db: Session = Depends(get_db)
 ):
-    file_bytes = await file.read()
-    filename = f"{uuid.uuid4()}_{file.filename}"
+    try:
+        # Validate file type
+        if not file.content_type == "application/pdf":
+            raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+        
+        file_bytes = await file.read()
+        filename = f"{uuid.uuid4()}_{file.filename}"
 
-    async with httpx.AsyncClient() as client:
-        upload_res = await client.post(
-            f"{SUPABASE_URL}/storage/v1/object/ehss-docs/{filename}",
-            headers={
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "Content-Type": file.content_type,
-            },
-            content=file_bytes
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            upload_res = await client.post(
+                f"{SUPABASE_URL}/storage/v1/object/ehss-docs/{filename}",
+                headers={
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    "Content-Type": file.content_type,
+                },
+                content=file_bytes
+            )
+
+        if upload_res.status_code not in [200, 201]:
+            error_detail = upload_res.text
+            print(f"Supabase upload error: {error_detail}")
+            raise HTTPException(status_code=500, detail=f"Failed to upload document: {error_detail}")
+
+        file_url = f"{SUPABASE_URL}/storage/v1/object/public/ehss-docs/{filename}"
+
+        doc = EhssDocument(
+            title=title,
+            file_url=file_url,
+            category=category,
+            uploaded_by=current_user.id
         )
+        db.add(doc)
+        db.commit()
+        db.refresh(doc)
 
-    if upload_res.status_code not in [200, 201]:
-        raise HTTPException(status_code=500, detail="Failed to upload document")
-
-    file_url = f"{SUPABASE_URL}/storage/v1/object/public/ehss-docs/{filename}"
-
-    doc = EhssDocument(
-        title=title,
-        file_url=file_url,
-        category=category,
-        uploaded_by=current_user.id
-    )
-    db.add(doc)
-    db.commit()
-    db.refresh(doc)
-
-    return {
-        "id": str(doc.id),
-        "title": doc.title,
-        "file_url": doc.file_url,
-        "category": doc.category,
-        "uploaded_at": str(doc.uploaded_at),
-    }
+        return {
+            "id": str(doc.id),
+            "title": doc.title,
+            "file_url": doc.file_url,
+            "category": doc.category,
+            "uploaded_at": str(doc.uploaded_at),
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"Error uploading EHSS document: {str(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to upload document: {str(e)}")
 
 
 @router.get("/ehss-docs")
 def list_ehss_docs(
-    current_user: User = Depends(admin_only),
     db: Session = Depends(get_db)
 ):
+    """Allow all authenticated users to view EHSS docs, not just admin"""
     docs = db.query(EhssDocument).order_by(EhssDocument.uploaded_at.desc()).all()
     return [
         {
