@@ -112,6 +112,9 @@ async def generate_report(
     if not inspection:
         raise HTTPException(status_code=404, detail="Inspection not found")
 
+    if current_user.role == "inspector" and str(inspection.user_id) != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Not authorized to generate this report")
+
     hazards = db.query(Hazard).filter(
         Hazard.inspection_id == inspection.id
     ).all()

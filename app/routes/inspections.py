@@ -86,10 +86,14 @@ async def analyze_inspection(
     if not inspection.image_url:
         raise HTTPException(status_code=400, detail="No image found for this inspection")
 
-    # Pakai satu-satunya pipeline resmi (YOLO SAHI + OCR + RAG + inferensi
-    # PPE) di ai_pipeline.py — supaya tidak ada logic ganda yang bisa beda
-    # hasil antara sini dan tempat lain.
-    hazard_results = await run_full_pipeline(inspection.image_url)
+    
+    try:
+        hazard_results = await run_full_pipeline(inspection.image_url)
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"AI analysis failed (YOLO/RAG service error): {str(e)}"
+        )
 
     # Simpan hazards + corrective actions
     hazard_list = []
@@ -138,17 +142,6 @@ async def analyze_inspection(
         "hazards": hazard_list
     }
 
-
-# ── POST /inspections/live-preview ─────────────────────────
-# Endpoint ringan buat live camera preview (Opsi A): TIDAK nulis ke DB,
-# TIDAK panggil OCR/RAG — cuma deteksi cepat buat gambar bounding box
-# di video secara berkala (dipanggil tiap ~1-2 detik dari Streamlit).
-# Analisis resmi tetap lewat POST /inspections lalu /analyze seperti biasa.
-#
-# PENTING: endpoint /detect (yang "cepat", dipakai buat live preview) itu
-# beda format dari /detect-sahi — dia expect JSON {"image_url": ...},
-# BUKAN file upload. Jadi frame preview tetap perlu diupload ke Supabase
-# dulu (path per-user, upsert supaya tidak numpuk) baru URL-nya dikirim.
 import httpx
 YOLO_SERVICE_URL = os.getenv("YOLO_SERVICE_URL", "http://localhost:8000")
 
