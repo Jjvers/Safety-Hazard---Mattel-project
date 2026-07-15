@@ -9,6 +9,7 @@ from app.database import get_db
 from app.middleware.auth import admin_only
 from app.models.user import User
 from app.models.ehss_document import EhssDocument
+from app.services import email_service
 
 router = APIRouter()
 
@@ -57,6 +58,14 @@ def approve_user(
 
     user.status = body.status
     db.commit()
+
+    try:
+        if body.status == "active":
+            email_service.send_approved(user.email, user.name)
+        elif body.status == "inactive":
+            email_service.send_rejected(user.email, user.name)
+    except Exception as e:
+        print(f"[EMAIL ERROR] Failed to send approval status email: {e}")
 
     return {"message": f"User {body.status} successfully", "user_id": user_id}
 

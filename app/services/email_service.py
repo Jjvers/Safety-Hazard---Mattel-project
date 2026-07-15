@@ -1,54 +1,60 @@
 import os
-import httpx
 import secrets
+import base64
 from datetime import datetime, timedelta
+from email.mime.text import MIMEText
 from typing import Optional
 
-# ── Resend (HTTPS email API) ─────────────────────────────────
-# Railway memblokir semua koneksi SMTP keluar (port 25/465/587) di
-# paket Free, Trial, dan Hobby — jadi tidak peduli sebagus apa fix
-# socket-nya, SMTP langsung ke Gmail TIDAK AKAN PERNAH bisa connect
-# dari Railway kecuali upgrade ke paket Pro. Solusinya: pakai API
-# email lewat HTTPS (port 443), yang tidak pernah diblokir.
-#
-# Daftar gratis di https://resend.com, lalu ambil API key di
-# https://resend.com/api-keys, dan set sebagai env var RESEND_API_KEY
-# di Railway Variables.
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")
-RESEND_API_URL = "https://api.resend.com/emails"
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-# MAIL_FROM harus pakai domain yang sudah diverifikasi di Resend
-# (Resend > Domains). Untuk testing cepat TANPA verifikasi domain,
-# pakai alamat bawaan Resend: onboarding@resend.dev
-MAIL_FROM = os.getenv("MAIL_FROM", "SafetyVision EHSS <onboarding@resend.dev>")
+GMAIL_CLIENT_ID     = os.getenv("GMAIL_CLIENT_ID")
+GMAIL_CLIENT_SECRET = os.getenv("GMAIL_CLIENT_SECRET")
+GMAIL_REFRESH_TOKEN = os.getenv("GMAIL_REFRESH_TOKEN")
+GMAIL_SENDER        = os.getenv("GMAIL_SENDER")  # alamat Gmail pengirim, misal: safetyvision.ehss@gmail.com
+
+MAIL_FROM = os.getenv("MAIL_FROM", f"SafetyVision EHSS <{GMAIL_SENDER}>")
 APP_URL   = os.getenv("APP_URL", "https://safetyvision-backend-production.up.railway.app")
 
 reset_tokens: dict = {}
 
 
+def _get_gmail_service():
+    """Bangun Gmail API client dari refresh token. Access token di-refresh
+    otomatis oleh library google-auth setiap kali dipanggil (access token
+    Google cuma berlaku ~1 jam, tapi refresh token tidak pernah kedaluwarsa
+    selama tidak di-revoke manual)."""
+    creds = Credentials(
+        token=None,
+        refresh_token=GMAIL_REFRESH_TOKEN,
+        client_id=GMAIL_CLIENT_ID,
+        client_secret=GMAIL_CLIENT_SECRET,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=["https://www.googleapis.com/auth/gmail.send"],
+    )
+    creds.refresh(GoogleAuthRequest())
+    return build("gmail", "v1", credentials=creds)
+
+
 def send_email(to_email: str, subject: str, html_body: str) -> bool:
-    if not RESEND_API_KEY:
-        print("[EMAIL ERROR] RESEND_API_KEY belum di-set di environment variables")
+    if not all([GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, GMAIL_SENDER]):
+        print("[EMAIL ERROR] GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET / GMAIL_REFRESH_TOKEN / GMAIL_SENDER belum lengkap di environment variables")
         return False
     try:
-        response = httpx.post(
-            RESEND_API_URL,
-            headers={
-                "Authorization": f"Bearer {RESEND_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "from": MAIL_FROM,
-                "to": [to_email],
-                "subject": subject,
-                "html": html_body,
-            },
-            timeout=15,
-        )
-        if response.status_code >= 400:
-            print(f"[EMAIL ERROR] Resend API {response.status_code}: {response.text}")
-            return False
+        message = MIMEText(html_body, "html")
+        message["to"] = to_email
+        message["from"] = MAIL_FROM
+        message["subject"] = subject
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+        service = _get_gmail_service()
+        service.users().messages().send(userId="me", body={"raw": raw}).execute()
         return True
+    except HttpError as e:
+        print(f"[EMAIL ERROR] Gmail API {e.status_code}: {e.reason}")
+        return False
     except Exception as e:
         print(f"[EMAIL ERROR] {e}")
         return False
@@ -118,6 +124,18 @@ def send_rejected(to_email: str, name: str) -> bool:
     <div class="text">Your access request has been <strong>declined</strong>. Status: <span class="badge badge-inactive">REJECTED</span></div>
     <div class="text">If you believe this is a mistake, please contact your EHSS Manager or Administrator.</div>"""
     return send_email(to_email, "SafetyVision — Access Request Update", base_template(content))
+
+def send_critical_hazard(to_email: str, inspector_name: str, location: str, hazard_labels: list[str], inspection_id: str) -> bool:
+    hazard_list_html = "".join(f"<li>{h}</li>" for h in hazard_labels)
+    content = f"""
+    <div class="greeting">⚠️ Critical Hazard Detected</div>
+    <div class="text">A safety inspection flagged <strong>critical-risk hazard(s)</strong> that require immediate attention.</div>
+    <div class="text"><strong>Inspector:</strong> {inspector_name}<br><strong>Location:</strong> {location}<br><strong>Inspection ID:</strong> {inspection_id[:8]}...</div>
+    <div class="text"><strong>Hazards found:</strong><ul style="margin:8px 0;padding-left:20px;color:#6B7280;">{hazard_list_html}</ul></div>
+    <hr class="divider">
+    <a href="{APP_URL}" class="btn">Review in SafetyVision →</a>"""
+    return send_email(to_email, f"SafetyVision — CRITICAL Hazard at {location}", base_template(content))
+
 
 def generate_reset_token(email: str) -> str:
     token = secrets.token_urlsafe(32)

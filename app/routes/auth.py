@@ -49,6 +49,17 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
 
+    # Email tidak boleh gagalkan register kalau ada masalah kirim email
+    # (Gmail API down, kredensial belum di-set, dll) — user tetap harus
+    # bisa daftar, notifikasi itu bonus bukan syarat.
+    try:
+        email_service.send_register_user(user.email, user.name, user.role)
+        admins = db.query(User).filter(User.role == "admin", User.status == "active").all()
+        for admin in admins:
+            email_service.send_register_admin(admin.email, user.name, user.email, user.role)
+    except Exception as e:
+        print(f"[EMAIL ERROR] Failed to send registration emails: {e}")
+
     return {"user_id": str(user.id), "message": "Account created. Waiting for Admin approval."}
 
 
