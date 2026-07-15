@@ -10,8 +10,155 @@ from app.models.user import User
 from app.models.inspection import Inspection
 from app.models.hazard import Hazard
 from app.models.corrective_action import CorrectiveAction
-from app.services.ai_pipeline import run_full_pipeline
+from app.services.ai_pipeline import call_yolo, call_rag
+from app.services.severity_rules import get_severity
 from app.services import email_service
+
+
+# ── Geometry & PPE inference helpers ───────────────────────────────
+def compute_iou(box_a, box_b):
+    """
+    Hitung Intersection-over-Union dua bbox berbentuk list [x1, y1, x2, y2].
+    Defensif: menerima list kosong / kurang dari 4 elemen / box zero-area,
+    dan TIDAK PERNAH raise IndexError, ZeroDivisionError, atau TypeError.
+    Kembalikan 0.0 untuk semua kasus yang tidak valid.
+    """
+    # Harus list/tuple dengan minimal 4 elemen (pakai len(), bukan .get())
+    if not isinstance(box_a, (list, tuple)) or not isinstance(box_b, (list, tuple)):
+        return 0.0
+    if len(box_a) < 4 or len(box_b) < 4:
+        return 0.0
+
+    try:
+        ax1, ay1, ax2, ay2 = float(box_a[0]), float(box_a[1]), float(box_a[2]), float(box_a[3])
+        bx1, by1, bx2, by2 = float(box_b[0]), float(box_b[1]), float(box_b[2]), float(box_b[3])
+    except (TypeError, ValueError):
+        return 0.0
+
+    # Normalisasi supaya (x1,y1) pojok kiri-atas, (x2,y2) pojok kanan-bawah
+    ax1, ax2 = min(ax1, ax2), max(ax1, ax2)
+    ay1, ay2 = min(ay1, ay2), max(ay1, ay2)
+    bx1, bx2 = min(bx1, bx2), max(bx1, bx2)
+    by1, by2 = min(by1, by2), max(by1, by2)
+
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
+    if area_a <= 0 or area_b <= 0:  # box zero-area → IoU tidak bermakna
+        return 0.0
+
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+
+    union = area_a + area_b - inter
+    if union <= 0:  # guard ZeroDivisionError
+        return 0.0
+
+    return inter / union
+
+
+def infer_ppe_violations(detections):
+    """
+    Inferensi pelanggaran PPE per-orang dari deteksi mentah YOLO.
+
+    Return: list baru berisi HANYA (1) pelanggaran PPE hasil inferensi
+    ("no_helmet"/"no_safety_vest") + (2) hazard non-PPE (dengan risk_level
+    dilekatkan). Deteksi mentah person/helmet/hard_hat/safety_vest/vest
+    TIDAK ikut muncul di output.
+
+    Semua akses key dict pakai .get() dengan default; aman terhadap input
+    kosong, dict tanpa key, tidak ada person, atau person tanpa helmet/vest.
+    """
+    HELMET_LABELS = {"helmet", "hard_hat"}
+    VEST_LABELS = {"safety_vest", "vest"}
+    PPE_LABELS = {"person", "helmet", "hard_hat", "safety_vest", "vest"}
+    RISK_MAP = {
+        "blocked_walkway":   "high",
+        "wet_floor":         "medium",
+        "exposed_cable":     "high",
+        "fire_hazard":       "critical",
+        "spill":             "medium",
+        "missing_guardrail": "critical",
+    }
+    HELMET_IOU_THRESHOLD = 0.05
+    VEST_IOU_THRESHOLD = 0.10
+
+    if not isinstance(detections, (list, tuple)) or not detections:
+        return []
+
+    persons, helmets, vests, output = [], [], [], []
+
+    for det in detections:
+        if not isinstance(det, dict):
+            continue
+        label = str(det.get("label", "")).lower()
+
+        if label == "person":
+            persons.append(det)
+        elif label in HELMET_LABELS:
+            helmets.append(det)
+        elif label in VEST_LABELS:
+            vests.append(det)
+        elif label in PPE_LABELS:
+            # PPE lain yang harus difilter keluar — jangan diteruskan
+            continue
+        else:
+            # Hazard non-PPE → teruskan dengan risk_level dari mapping
+            hazard = dict(det)
+            hazard["risk_level"] = RISK_MAP.get(label, "medium")
+            output.append(hazard)
+
+    # Cek PPE per orang lewat hubungan spasial (IoU)
+    for person in persons:
+        person_bbox = person.get("bbox", [])
+        if not isinstance(person_bbox, (list, tuple)) or len(person_bbox) < 4:
+            # Tanpa bbox valid → tidak bisa inferensi spasial, lewati orang ini
+            continue
+
+        try:
+            px1, py1, px2, py2 = (
+                float(person_bbox[0]), float(person_bbox[1]),
+                float(person_bbox[2]), float(person_bbox[3]),
+            )
+        except (TypeError, ValueError):
+            continue
+
+        y_top, y_bot = min(py1, py2), max(py1, py2)
+        x_left, x_right = min(px1, px2), max(px1, px2)
+        # Region kepala = separuh ATAS bbox person (untuk cek helmet)
+        top_half = [x_left, y_top, x_right, y_top + (y_bot - y_top) / 2.0]
+
+        wearing_helmet = any(
+            compute_iou(h.get("bbox", []), top_half) >= HELMET_IOU_THRESHOLD
+            for h in helmets
+        )
+        # Vest dicek terhadap SELURUH bbox person
+        wearing_vest = any(
+            compute_iou(v.get("bbox", []), person_bbox) >= VEST_IOU_THRESHOLD
+            for v in vests
+        )
+
+        if not wearing_helmet:
+            output.append({
+                "label":      "no_helmet",
+                "yolo_label": "no_helmet",
+                "confidence": 0.90,
+                "bbox":       person_bbox,
+                "risk_level": "high",
+                "inferred":   True,
+            })
+        if not wearing_vest:
+            output.append({
+                "label":      "no_safety_vest",
+                "yolo_label": "no_safety_vest",
+                "confidence": 0.90,
+                "bbox":       person_bbox,
+                "risk_level": "high",
+                "inferred":   True,
+            })
+
+    return output
+
 
 router = APIRouter()
 
@@ -87,35 +234,76 @@ async def analyze_inspection(
     if not inspection.image_url:
         raise HTTPException(status_code=400, detail="No image found for this inspection")
 
-    
+
+    # 1. YOLO detection — raw detections diterima di sini.
     try:
-        hazard_results = await run_full_pipeline(inspection.image_url)
+        detections = await call_yolo(inspection.image_url)
     except Exception as e:
         raise HTTPException(
             status_code=502,
             detail=f"AI analysis failed (YOLO/RAG service error): {str(e)}"
         )
 
-    # Simpan hazards + corrective actions
+    # 2. Inferensi pelanggaran PPE per-orang + teruskan hazard non-PPE.
+    #    Deteksi mentah person/helmet/safety_vest difilter keluar di dalam
+    #    infer_ppe_violations; hasilnya dipakai untuk RAG dan simpan ke DB.
+    enriched_hazards = infer_ppe_violations(detections)
+
+    ocr_text = ""
+
+    # Helper baca label & confidence lintas format dict (mentah vs sintetis).
+    def _label(d):
+        return d.get("label") or d.get("yolo_label") or ""
+
+    def _confidence(d):
+        c = d.get("confidence")
+        if c is None:
+            c = d.get("confidence_score", 1.0)
+        return c
+
+    # 3. RAG — kirim enriched_hazards sekaligus (batch). Gagal = non-fatal.
+    hazard_inputs = [
+        {
+            "label":            _label(d),
+            "confidence_score": _confidence(d),
+            "ocr_text":         ocr_text,
+        }
+        for d in enriched_hazards
+    ]
+    try:
+        rag_results = await call_rag(hazard_inputs)
+    except Exception:
+        rag_results = []
+    rag_map = {r["label"]: r for r in rag_results if isinstance(r, dict) and "label" in r}
+
+    # 4. Simpan hazards + corrective actions dari enriched_hazards
     hazard_list = []
-    for h in hazard_results:
+    for h in enriched_hazards:
+        label      = _label(h)
+        confidence = _confidence(h)
+        severity   = get_severity(label, confidence)
+        rag        = rag_map.get(label, {})
+        # Utamakan risk_level dari infer_ppe_violations bila ada, else severity.
+        risk_level = h.get("risk_level") or severity["risk_level"]
+        action_description = rag.get("action_description", "Refer to EHSS guidelines")
+
         hazard = Hazard(
             inspection_id=inspection.id,
-            category=h["category"],
-            risk_level=h["risk_level"],
-            confidence_score=h["confidence_score"],
-            yolo_label=h["yolo_label"],
-            ocr_text=h["ocr_text"],
-            description=h["corrective_action"]["action_description"]
+            category=label.replace("_", " ").title(),
+            risk_level=risk_level,
+            confidence_score=confidence,
+            yolo_label=label,
+            ocr_text=ocr_text,
+            description=action_description
         )
         db.add(hazard)
         db.flush()
 
         action = CorrectiveAction(
             hazard_id=hazard.id,
-            action_description=h["corrective_action"]["action_description"],
-            priority=h["corrective_action"]["priority"],
-            due_date=h["corrective_action"]["due_date"],
+            action_description=action_description,
+            priority=severity["priority"],
+            due_date=severity["due_date"],
             action_status="open"
         )
         db.add(action)
