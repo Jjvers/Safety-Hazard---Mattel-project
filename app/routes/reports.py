@@ -16,8 +16,21 @@ from app.models.inspection import Inspection
 from app.models.hazard import Hazard
 from app.models.corrective_action import CorrectiveAction
 from app.models.report import Report
+from app.models.user import User
 
 router = APIRouter()
+
+# Urutan keparahan untuk menentukan risk tertinggi sebuah inspeksi.
+_RISK_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+
+
+def _overall_risk(hazards) -> str:
+    """Risk level tertinggi dari sekumpulan hazard (default 'low')."""
+    best = "low"
+    for h in hazards:
+        if _RISK_ORDER.get(h.risk_level, 0) > _RISK_ORDER.get(best, 0):
+            best = h.risk_level
+    return best
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -183,3 +196,114 @@ async def download_report(
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=report_{report_id}.pdf"}
     )
+
+
+# ── GET /reports/list ──────────────────────────────────────
+@router.get("/list")
+def list_reports(
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Daftar inspeksi yang sudah dianalisa (untuk tabel Reports).
+    Inspector hanya melihat miliknya; manager/admin melihat semua.
+    Tiap baris: tanggal, lokasi, inspector, status, risk tertinggi,
+    jumlah hazard, dan label hazard.
+    """
+    query = db.query(Inspection).filter(
+        Inspection.status.in_(["analyzed", "reported"])
+    )
+    if current_user.role == "inspector":
+        query = query.filter(Inspection.user_id == current_user.id)
+
+    inspections = query.order_by(Inspection.created_at.desc()).all()
+
+    # Peta user_id → nama inspector (hindari query N+1).
+    user_ids = {i.user_id for i in inspections}
+    users = db.query(User).filter(User.id.in_(user_ids)).all() if user_ids else []
+    name_map = {str(u.id): u.name for u in users}
+
+    # Cek report yang sudah tergenerate untuk tombol download.
+    report_map = {}
+    for r in db.query(Report).all():
+        # simpan report terbaru per inspection
+        report_map[str(r.inspection_id)] = str(r.id)
+
+    rows = []
+    for insp in inspections:
+        hazards = db.query(Hazard).filter(Hazard.inspection_id == insp.id).all()
+        rows.append({
+            "id": str(insp.id),
+            "report_id": report_map.get(str(insp.id)),
+            "date": str(insp.inspected_at)[:10] if insp.inspected_at else "",
+            "location": insp.location,
+            "area": insp.area,
+            "inspector": name_map.get(str(insp.user_id), "-"),
+            "status": insp.status,
+            "risk": _overall_risk(hazards),
+            "issues": len(hazards),
+            "hazards": [h.category for h in hazards],
+        })
+
+    return rows
+
+
+# ── GET /reports/detail/{inspection_id} ────────────────────
+@router.get("/detail/{inspection_id}")
+def report_detail(
+    inspection_id: str,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Detail satu inspeksi + hazard + corrective action (untuk modal Reports)."""
+    inspection = db.query(Inspection).filter(
+        Inspection.id == inspection_id
+    ).first()
+    if not inspection:
+        raise HTTPException(status_code=404, detail="Inspection not found")
+
+    if current_user.role == "inspector" and str(inspection.user_id) != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    inspector = db.query(User).filter(User.id == inspection.user_id).first()
+    hazards = db.query(Hazard).filter(Hazard.inspection_id == inspection.id).all()
+
+    report = db.query(Report).filter(
+        Report.inspection_id == inspection.id
+    ).order_by(Report.generated_at.desc()).first()
+
+    hazard_list = []
+    for h in hazards:
+        actions = db.query(CorrectiveAction).filter(
+            CorrectiveAction.hazard_id == h.id
+        ).all()
+        hazard_list.append({
+            "id": str(h.id),
+            "category": h.category,
+            "risk_level": h.risk_level,
+            "confidence_score": h.confidence_score,
+            "yolo_label": h.yolo_label,
+            "corrective_actions": [
+                {
+                    "action_description": a.action_description,
+                    "priority": a.priority,
+                    "due_date": str(a.due_date),
+                    "action_status": a.action_status,
+                }
+                for a in actions
+            ],
+        })
+
+    return {
+        "id": str(inspection.id),
+        "report_id": str(report.id) if report else None,
+        "date": str(inspection.inspected_at)[:10] if inspection.inspected_at else "",
+        "location": inspection.location,
+        "area": inspection.area,
+        "image_url": inspection.image_url,
+        "inspector": inspector.name if inspector else "-",
+        "status": inspection.status,
+        "risk": _overall_risk(hazards),
+        "issues": len(hazards),
+        "hazards": hazard_list,
+    }

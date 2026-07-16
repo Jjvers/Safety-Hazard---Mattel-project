@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from app.database import get_db
-from app.middleware.auth import admin_only
+from pydantic import EmailStr
+from app.middleware.auth import admin_only, hash_password
 from app.models.user import User
 from app.models.ehss_document import EhssDocument
 from app.services import email_service
@@ -22,6 +23,14 @@ class ApproveRequest(BaseModel):
     status: str  # active / inactive
 
 class UpdateUserRequest(BaseModel):
+    employee_id: str | None = None
+    department: str | None = None
+
+class CreateUserRequest(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    role: str  # inspector / manager / admin
     employee_id: str | None = None
     department: str | None = None
 
@@ -41,6 +50,48 @@ def list_users(current_user = Depends(admin_only), db: Session = Depends(get_db)
         }
         for u in users
     ]
+
+@router.post("/users", status_code=201)
+def create_user(
+    body: CreateUserRequest,
+    current_user=Depends(admin_only),
+    db: Session = Depends(get_db),
+):
+    """
+    Admin membuat user baru langsung dalam status 'active' (tanpa perlu
+    alur approval seperti registrasi publik).
+    """
+    if body.role not in ["inspector", "manager", "admin"]:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    if len(body.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    existing = db.query(User).filter(User.email == body.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    user = User(
+        name=body.name,
+        email=body.email,
+        password_hash=hash_password(body.password),
+        role=body.role,
+        status="active",  # dibuat admin → langsung aktif
+        employee_id=body.employee_id,
+        department=body.department,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "id": str(user.id),
+        "name": user.name,
+        "email": user.email,
+        "role": user.role,
+        "status": user.status,
+        "employee_id": user.employee_id,
+        "department": user.department,
+    }
 
 @router.patch("/users/{user_id}/approve")
 def approve_user(
@@ -170,3 +221,27 @@ def list_ehss_docs(
         }
         for d in docs
     ]
+
+# ── DELETE /admin/ehss-docs/{doc_id} ────────────────────────
+@router.delete("/ehss-docs/{doc_id}")
+def delete_ehss_doc(
+    doc_id: str,
+    current_user: User = Depends(admin_only),
+    db: Session = Depends(get_db),
+):
+    doc = db.query(EhssDocument).filter(EhssDocument.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # Hapus file dari Supabase Storage (best-effort — kegagalan hapus file
+    # tidak boleh menggagalkan penghapusan record DB).
+    try:
+        filename = doc.file_url.split("/ehss-docs/")[-1]
+        if filename:
+            get_supabase().storage.from_("ehss-docs").remove([filename])
+    except Exception as e:
+        print(f"[STORAGE WARN] Failed to delete EHSS doc file: {e}")
+
+    db.delete(doc)
+    db.commit()
+    return {"message": "Document deleted successfully", "id": doc_id}

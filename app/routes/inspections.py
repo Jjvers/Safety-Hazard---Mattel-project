@@ -16,24 +16,48 @@ from app.services import email_service
 
 
 # ── Geometry & PPE inference helpers ───────────────────────────────
+def bbox_to_list(bbox):
+    """
+    Normalisasi bbox ke list [x1, y1, x2, y2].
+
+    YOLO Johana mengembalikan bbox sebagai DICT
+    {"x1","y1","x2","y2","width","height"}, tapi sebagian kode/legacy
+    memakai list [x1,y1,x2,y2]. Terima kedua bentuk; kembalikan [] untuk
+    input yang tidak valid (None, dict tanpa key, list < 4 elemen, dst)
+    supaya pemanggil bisa memutuskan sendiri. TIDAK PERNAH raise.
+    """
+    if isinstance(bbox, dict):
+        try:
+            return [
+                float(bbox["x1"]), float(bbox["y1"]),
+                float(bbox["x2"]), float(bbox["y2"]),
+            ]
+        except (KeyError, TypeError, ValueError):
+            return []
+    if isinstance(bbox, (list, tuple)):
+        if len(bbox) < 4:
+            return []
+        try:
+            return [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
+        except (TypeError, ValueError):
+            return []
+    return []
+
+
 def compute_iou(box_a, box_b):
     """
-    Hitung Intersection-over-Union dua bbox berbentuk list [x1, y1, x2, y2].
-    Defensif: menerima list kosong / kurang dari 4 elemen / box zero-area,
-    dan TIDAK PERNAH raise IndexError, ZeroDivisionError, atau TypeError.
-    Kembalikan 0.0 untuk semua kasus yang tidak valid.
+    Hitung Intersection-over-Union dua bbox. Menerima bentuk list
+    [x1, y1, x2, y2] MAUPUN dict {"x1","y1","x2","y2"} (dinormalisasi
+    lewat bbox_to_list). Defensif: box kosong / kurang dari 4 elemen /
+    zero-area → kembalikan 0.0. TIDAK PERNAH raise.
     """
-    # Harus list/tuple dengan minimal 4 elemen (pakai len(), bukan .get())
-    if not isinstance(box_a, (list, tuple)) or not isinstance(box_b, (list, tuple)):
-        return 0.0
-    if len(box_a) < 4 or len(box_b) < 4:
+    a = bbox_to_list(box_a)
+    b = bbox_to_list(box_b)
+    if not a or not b:
         return 0.0
 
-    try:
-        ax1, ay1, ax2, ay2 = float(box_a[0]), float(box_a[1]), float(box_a[2]), float(box_a[3])
-        bx1, by1, bx2, by2 = float(box_b[0]), float(box_b[1]), float(box_b[2]), float(box_b[3])
-    except (TypeError, ValueError):
-        return 0.0
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
 
     # Normalisasi supaya (x1,y1) pojok kiri-atas, (x2,y2) pojok kanan-bawah
     ax1, ax2 = min(ax1, ax2), max(ax1, ax2)
@@ -110,18 +134,13 @@ def infer_ppe_violations(detections):
 
     # Cek PPE per orang lewat hubungan spasial (IoU)
     for person in persons:
-        person_bbox = person.get("bbox", [])
-        if not isinstance(person_bbox, (list, tuple)) or len(person_bbox) < 4:
+        # bbox bisa dict {"x1",...} (format YOLO) atau list — normalisasi dulu.
+        person_bbox = bbox_to_list(person.get("bbox"))
+        if not person_bbox:
             # Tanpa bbox valid → tidak bisa inferensi spasial, lewati orang ini
             continue
 
-        try:
-            px1, py1, px2, py2 = (
-                float(person_bbox[0]), float(person_bbox[1]),
-                float(person_bbox[2]), float(person_bbox[3]),
-            )
-        except (TypeError, ValueError):
-            continue
+        px1, py1, px2, py2 = person_bbox
 
         y_top, y_bot = min(py1, py2), max(py1, py2)
         x_left, x_right = min(px1, px2), max(px1, px2)
@@ -256,9 +275,14 @@ async def analyze_inspection(
         return d.get("label") or d.get("yolo_label") or ""
 
     def _confidence(d):
+        # Terima "confidence" (dict sintetis) maupun "confidence_score" (deteksi
+        # mentah). Kalau kedua-duanya None/hilang, fallback ke 1.0 supaya
+        # get_severity tidak crash saat membandingkan confidence < 0.5.
         c = d.get("confidence")
         if c is None:
-            c = d.get("confidence_score", 1.0)
+            c = d.get("confidence_score")
+        if c is None:
+            c = 1.0
         return c
 
     # 3. RAG — kirim enriched_hazards sekaligus (batch). Gagal = non-fatal.
@@ -355,6 +379,40 @@ async def analyze_inspection(
 import httpx
 YOLO_SERVICE_URL = os.getenv("YOLO_SERVICE_URL", "http://localhost:8000")
 
+
+def build_preview_boxes(detections):
+    """
+    Ubah deteksi mentah YOLO menjadi kotak siap-gambar untuk frontend.
+
+    - Hazard lingkungan + pelanggaran PPE hasil inferensi (no_helmet/
+      no_safety_vest) → danger=True (merah).
+    - Deteksi mentah person/helmet/safety_vest TIDAK ikut (difilter oleh
+      infer_ppe_violations), jadi overlay hanya menampilkan yang BENAR-BENAR
+      hazard. Kalau tidak ada hazard → list kosong (box hilang).
+
+    Setiap kotak: {label, confidence, danger, bbox:[x1,y1,x2,y2]}.
+    bbox dinormalisasi ke list; kotak tanpa bbox valid dibuang (tak bisa
+    digambar).
+    """
+    enriched = infer_ppe_violations(detections)
+    boxes = []
+    for d in enriched:
+        bbox = bbox_to_list(d.get("bbox"))
+        if not bbox:
+            continue
+        label = d.get("label") or d.get("yolo_label") or ""
+        confidence = d.get("confidence")
+        if confidence is None:
+            confidence = d.get("confidence_score", 0.0)
+        boxes.append({
+            "label":      label.replace("_", " "),
+            "confidence": confidence,
+            "danger":     True,  # infer_ppe_violations hanya keluarkan hazard
+            "bbox":       bbox,
+        })
+    return boxes
+
+
 @router.post("/live-preview")
 async def live_preview(
     image: UploadFile = File(...),
@@ -379,11 +437,13 @@ async def live_preview(
         async with httpx.AsyncClient(timeout=8.0) as client:
             res = await client.post(f"{YOLO_SERVICE_URL}/detect", json={"image_url": image_url})
             res.raise_for_status()
-            detections = res.json().get("detections", [])
+            raw_detections = res.json().get("detections", [])
     except Exception:
-        detections = []
+        raw_detections = []
 
-    return {"detections": detections}
+    # Kembalikan kotak yang sudah dienrich (hazard + inferensi PPE) supaya
+    # frontend tinggal menggambar; box hanya muncul saat ada hazard nyata.
+    return {"detections": build_preview_boxes(raw_detections)}
 @router.get("/")
 def list_inspections(
     current_user: User = Depends(get_current_user),
